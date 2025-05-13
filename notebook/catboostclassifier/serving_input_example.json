@@ -1,0 +1,22 @@
+{
+  "dataframe_split": {
+    "columns": [
+      "age",
+      "sex",
+      "job",
+      "housing",
+      "credit_amount",
+      "duration"
+    ],
+    "data": [
+      [
+        29,
+        "female",
+        "skilled",
+        "own",
+        2171,
+        12
+      ]
+    ]
+  }
+}
