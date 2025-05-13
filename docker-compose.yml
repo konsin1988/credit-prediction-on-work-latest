@@ -30,7 +30,6 @@ services:
     volumes:
       - ./fastapi:/fastapi/src
     environment:
-      - AWS_DEFAULT_REGION=my_region
       - MINIO_ACCESS_KEY=${MINIO_ROOT_USER}
       - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD}
     healthcheck:
@@ -65,21 +64,16 @@ services:
     volumes:
         - ./mlflow:/mlflow
     environment:
-        - MLFLOW_S3_ENDPOINT_URL=http://s3:9099/mlflow
+        - MLFLOW_S3_ENDPOINT_URL=http://s3:9099/
         - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER}
         - AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD}
         - MLFLOW_TRACKING_USERNAME=${MLFLOW_TRACKING_USERNAME}
         - MLFLOW_TRACKING_PASSWORD=${MLFLOW_TRACKING_PASSWORD}
-        # - DB_NAME=${DB_NAME}
-        # - DB_USER=${DB_USER}
-        # - DB_PASSWORD=${DB_PASSWORD}
-        # - DB_HOST=${DB_HOST}
-        # - DB_PORT=${DB_PORT}
-    # command: mlflow server --backend-store-uri mysql+pymysql://${MYSQL_USER}:${MYSQL_PASSWORD}@db:3306/${MYSQL_DATABASE} --default-artifact-root s3://mlflow/ --host 0.0.0.0
-    command: mlflow server --backend-store-uri postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${MLFLOW_DB_NAME} --artifacts-destination s3://mlflow/ --serve-artifacts --host 0.0.0.0
-    # command: mlflow server --backend-store-uri postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${MLFLOW_DB_NAME} --serve-artifacts --artifacts-destination s3://mlflow/ --host 0.0.0.0
+    command: mlflow server --backend-store-uri postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}:${DB_PORT}/${MLFLOW_DB_NAME} --default-artifact-root s3://mlflow --serve-artifacts --host 0.0.0.0
     networks:
         - cp-network
+
+        # --artifacts-destination s3://mlflow
 
   # notebook:
   #     platform: linux/amd64
