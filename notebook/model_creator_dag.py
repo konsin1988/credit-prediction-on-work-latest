@@ -2,7 +2,7 @@ import pandas as pd
 from catboost import CatBoostClassifier
 
 from airflow import DAG
-from airflow.operators.python_operator import PythonOperator
+from airflow.operators.python import PythonOperator
 from airflow.models import Variable
 
 from sklearn.model_selection import train_test_split, cross_val_score
@@ -33,28 +33,19 @@ from functools import reduce
 from datetime import datetime
 
 # IMPORT ENV VARIABLES -------------------------------------------------------
-# from dotenv import load_dotenv
-# import os
+from dotenv import load_dotenv
+import os
 
-# load_dotenv()
+load_dotenv()
 
-# DB_HOST = os.getenv('DB_HOST')
-# POSTGRESQL_PORT = os.getenv('POSTGRESQL_PORT')
-# DB_USER = os.getenv('DB_USER')
-# DB_PASSWORD = os.getenv('DB_PASSWORD')
-# DB_NAME = os.getenv('DB_NAME')
+DB_HOST = os.getenv('DB_HOST')
+POSTGRESQL_PORT = os.getenv('POSTGRESQL_PORT')
+DB_USER = os.getenv('DB_USER')
+DB_PASSWORD = os.getenv('DB_PASSWORD')
+DB_NAME = os.getenv('DB_NAME')
 
-# ACCESS_KEY=os.getenv('MINIO_ROOT_USER')
-# SECRET_KEY=os.getenv('MINIO_ROOT_PASSWORD')
-
-DB_HOST = Variable.get('CP_DB_HOST')
-POSTGRESQL_PORT = Variable.get('CP_POSTGRESQL_PORT')
-DB_USER = Variable.get('CP_DB_USER')
-DB_PASSWORD = Variable.get('CP_DB_PASSWORD')
-DB_NAME = Variable.get('CP_DB_NAME')
-
-ACCESS_KEY=Variable.get('CP_MINIO_ROOT_USER')
-SECRET_KEY=Variable.get('CP_MINIO_ROOT_PASSWORD')
+ACCESS_KEY=os.getenv('MINIO_ROOT_USER')
+SECRET_KEY=os.getenv('MINIO_ROOT_PASSWORD')
 
 # SET COLUMNS --------------------------------------------------------------------
 COLUMN_TYPES = {
@@ -81,6 +72,72 @@ job_list = {
     3: 'highly skilled'
 }
 
+conn = psycopg2.connect(dbname='credit',
+                                user=DB_USER,
+                                password=DB_PASSWORD,
+                                host='localhost',
+                                port=POSTGRESQL_PORT)
+cur = conn.cursor()
+cur.execute(f"SELECT {reduce(lambda a,b: a + ', ' + b, FEATURE_COLUMNS)} FROM credit;")
+X = (
+    pd
+    .DataFrame(cur.fetchall(), columns=FEATURE_COLUMNS)
+    .assign(job = lambda x: x['job'].apply(lambda x: job_list[x]))
+)
+conn.commit()
+conn.close()
+
+conn = psycopg2.connect(dbname='credit',
+                                user=DB_USER,
+                                password=DB_PASSWORD,
+                                host='localhost',
+                                port=POSTGRESQL_PORT)
+cur = conn.cursor()
+cur.execute(f'SELECT cr."{TARGET_COLUMN_NAME}" FROM credit cr;')
+y = [x[0] for x in cur.fetchall()]
+conn.commit()
+conn.close()
+
+# GET DATA
+
+df = X.join(pd.DataFrame(y, columns = [TARGET_COLUMN_NAME]))
+mlflow_dataset = mlflow.data.from_pandas(df, name='german_credit', targets='default')
+
+
+# MLFLOW CONNECTION ------------------------------------------------------------------
+warnings.filterwarnings('ignore')
+mlflow.set_tracking_uri('http://localhost:5000/')
+# print("URI", mlflow.get_tracking_uri())
+# -----------------------------------------------------------------------------------
+
+# CREATE PIPELINE AND X_PREPROCESSED -------------------------------------------------
+numeric_transformer = Pipeline(steps = [
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler())
+])
+categorical_transformer = Pipeline(steps = [
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
+])
+# 
+preprocessor = ColumnTransformer(
+    transformers=[
+        ("num", numeric_transformer, COLUMNS_TO_SCALE),
+        ("cat", categorical_transformer, COLUMNS_TO_ENCODE)
+    ]
+)
+X_preproccessed = preprocessor.fit_transform(X)
+#-------------------------------------------------------------------------------
+
+# TRAIN TEST SPLIT -------------------------------------------------------------
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y,
+    test_size = 0.25
+)
+# ---------------------------------------------------------------------------------
+
+# OPTIMIZE HYPERPARAMETERS AND WRITE IT TO MLFLOW  -------------------------------
+
 def objective(trial):
     global mlflow
     global X_preproccessed    
@@ -105,215 +162,88 @@ def objective(trial):
         mlflow.log_metric('Accuracy', accuracy) 
         return accuracy
 
-def get_data(task_instance):
+experiment_name = f'credit_pred_{datetime.now().strftime('01.%m.%Y')}'
+try:
+    mlflow.create_experiment(experiment_name)
+except:
+    pass
+mlflow.set_experiment(experiment_name)
 
-    conn = psycopg2.connect(dbname='credit',
-                                    user=DB_USER,
-                                    password=DB_PASSWORD,
-                                    host='localhost',
-                                    port=POSTGRESQL_PORT)
-    cur = conn.cursor()
-    cur.execute(f"SELECT {reduce(lambda a,b: a + ', ' + b, FEATURE_COLUMNS)} FROM credit;")
-    X = cur.fetchall()
-    conn.commit()
-    conn.close()
+with mlflow.start_run(run_name = f'params_opt_{datetime.now().strftime('%d.%m.%Y_%H:%M')}') as run:
+    study = optuna.create_study(direction="maximize", study_name=f"params_opt_{datetime.now().strftime('%Y%m%d-%H%M%S')}")
 
-    conn = psycopg2.connect(dbname='credit',
-                                    user=DB_USER,
-                                    password=DB_PASSWORD,
-                                    host='localhost',
-                                    port=POSTGRESQL_PORT)
-    cur = conn.cursor()
-    cur.execute(f'SELECT cr."{TARGET_COLUMN_NAME}" FROM credit cr;')
-    y = [x[0] for x in cur.fetchall()]
-    conn.commit()
-    conn.close()
-
-    task_instance.xcom_push(key='features', value=X)
-    task_instance.xcom_push(key='target', value=y)
-
-def train_model(task_instance):
-    # GET DATA
-    X = (
-        pd
-        .DataFrame(task_instance.xcom_pull(key='features'), columns=FEATURE_COLUMNS)
-        .assign(job = lambda x: x['job'].apply(lambda x: job_list[x]))
-    )
-    y = task_instance.xcom_pull(key='features')
-
-    df = X.join(pd.DataFrame(y, columns = [TARGET_COLUMN_NAME]))
-    mlflow_dataset = mlflow.data.from_pandas(df, name='german_credit', targets='default')
-
-
-    # MLFLOW CONNECTION ------------------------------------------------------------------
-    warnings.filterwarnings('ignore')
-    mlflow.set_tracking_uri('http://localhost:5000/')
-    # print("URI", mlflow.get_tracking_uri())
-    # -----------------------------------------------------------------------------------
-
-    # CREATE PIPELINE AND X_PREPROCESSED -------------------------------------------------
-    numeric_transformer = Pipeline(steps = [
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler())
-    ])
-    categorical_transformer = Pipeline(steps = [
-        ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
-    ])
-    # 
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ("num", numeric_transformer, COLUMNS_TO_SCALE),
-            ("cat", categorical_transformer, COLUMNS_TO_ENCODE)
-        ]
-    )
-    X_preproccessed = preprocessor.fit_transform(X)
-    #-------------------------------------------------------------------------------
-
-    # TRAIN TEST SPLIT -------------------------------------------------------------
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y,
-        test_size = 0.25
-    )
-    # ---------------------------------------------------------------------------------
-
-    # OPTIMIZE HYPERPARAMETERS AND WRITE IT TO MLFLOW  -------------------------------
+    # Hyperparams searching
+    study.optimize(objective, n_trials=4)
     
+    # best result is
+    params = study.best_params
 
+    estimator = CatBoostClassifier(**params, verbose=False)  
+    catboostclassifier = Pipeline(steps = [
+        ("preprocessor", preprocessor),
+        ("classifier", estimator)
+    ])
+    # catboostclassifier = CatBoostClassifier(**params, verbose=False)
+    catboostclassifier.fit(X_train, y_train)
+    
+    pred_test = catboostclassifier.predict(X_test)
+    signature = infer_signature(X_test, pred_test)
 
-    experiment_name = f'credit_pred_{datetime.now().strftime('01.%m.%Y')}'
-    try:
-        mlflow.create_experiment(experiment_name)
-    except:
-        pass
-    mlflow.set_experiment(experiment_name)
+    
+    metrics = {'accuracy': accuracy_score(pred_test, y_test),
+                'precision': precision_score(pred_test, y_test),
+                'recall': recall_score(pred_test, y_test),
+                'f1': f1_score(pred_test, y_test),
+                'roc_auc': roc_auc_score(y_test, catboostclassifier.predict_proba(X_test)[:,1])
+            }
 
-    with mlflow.start_run(run_name = f'params_opt_{datetime.now().strftime('%d.%m.%Y_%H:%M')}') as run:
-        study = optuna.create_study(direction="maximize", study_name=f"params_opt_{datetime.now().strftime('%Y%m%d-%H%M%S')}")
+    
+    input_example = X_train.iloc[[0], :]
+    mlflow.models.infer_signature(input_example, 0, params)
+    mlflow.log_params(params)
+    mlflow.log_metrics(metrics)
 
-        # Hyperparams searching
-        study.optimize(objective, n_trials=4)
-        
-        # best result is
-        params = study.best_params
+    mlflow.log_input(mlflow_dataset)
 
-        estimator = CatBoostClassifier(**params, verbose=False)  
-        catboostclassifier = Pipeline(steps = [
-            ("preprocessor", preprocessor),
-            ("classifier", estimator)
-        ])
-        # catboostclassifier = CatBoostClassifier(**params, verbose=False)
-        catboostclassifier.fit(X_train, y_train)
-        
-        pred_test = catboostclassifier.predict(X_test)
-        signature = infer_signature(X_test, pred_test)
+    mlflow.sklearn.log_model(sk_model=catboostclassifier, 
+                            artifact_path='catboostclassifier', 
+                            signature=signature,
+                            input_example=input_example
+                            )
 
-        
-        metrics = {'accuracy': accuracy_score(pred_test, y_test),
-                    'precision': precision_score(pred_test, y_test),
-                    'recall': recall_score(pred_test, y_test),
-                    'f1': f1_score(pred_test, y_test),
-                    'roc_auc': roc_auc_score(y_test, catboostclassifier.predict_proba(X_test)[:,1])
-                }
-
-        
-        input_example = X_train.iloc[[0], :]
-        mlflow.models.infer_signature(input_example, 0, params)
-        mlflow.log_params(params)
-        mlflow.log_metrics(metrics)
-
-        mlflow.log_input(mlflow_dataset)
-
-        mlflow.sklearn.log_model(sk_model=catboostclassifier, 
-                                artifact_path='catboostclassifier', 
-                                signature=signature,
-                                input_example=input_example
-                                )
-    task_instance.push(key='model', value=catboostclassifier)
-
-def save_model_to_file(task_instance):
     # save model.pkl
-    catboostclassifier = task_instance.pull(key='model')
-    with open('model.pkl', 'wb') as f:
-        pickle.dump(catboostclassifier, f)
+with open('model.pkl', 'wb') as f:
+    pickle.dump(catboostclassifier, f)
 
 # minio save model.pkl
-def s3_upload_model(task_instance):
     # Create a client with the MinIO server playground, its access key
     # and secret key.
-    client = Minio("localhost:9099",
-        access_key=ACCESS_KEY,
-        secret_key=SECRET_KEY,
-        secure=False
-    )
+client = Minio("localhost:9099",
+    access_key=ACCESS_KEY,
+    secret_key=SECRET_KEY,
+    secure=False
+)
 
-    # The file to upload, change this path if needed
-    source_file = "model.pkl"
+# The file to upload, change this path if needed
+source_file = "model.pkl"
 
-    # The destination bucket and filename on the MinIO server
-    bucket_name = "credit-model"
-    destination_file = "model.pkl"
+# The destination bucket and filename on the MinIO server
+bucket_name = "credit-model"
+destination_file = "model.pkl"
 
-    # Make the bucket if it doesn't exist.
-    found = client.bucket_exists(bucket_name)
-    if not found:
-        client.make_bucket(bucket_name)
-        print("Created bucket", bucket_name)
-    else:
-        print("Bucket", bucket_name, "already exists")
+# Make the bucket if it doesn't exist.
+found = client.bucket_exists(bucket_name)
+if not found:
+    client.make_bucket(bucket_name)
+    print("Created bucket", bucket_name)
+else:
+    print("Bucket", bucket_name, "already exists")
 
-    # Upload the file, renaming it in the process
-    client.fput_object(
-        bucket_name, destination_file, source_file,
-    )
-    print(
-        source_file, "successfully uploaded as object",
-        destination_file, "to bucket", bucket_name,
-    )
-
-
-# Определение DAG
-default_args = {
-    'owner': 'airflow',
-    'depends_on_past': False,
-    'start_date': datetime(2025, 5, 12)
-}
-
-with DAG(
-    'credit_prediction',
-    default_args=default_args,
-    catchup=False,
-    max_active_runs = 1,
-    description='DAG to learn model',
-    schedule_interval='@daily'
-) as dag:
-    # Определение задач
-    get_data = PythonOperator(
-        task_id='get_data',
-        python_callable=get_data,
-        dag=dag,
-        do_xcom_push=True
-    )
-
-    train_model = PythonOperator(
-        task_id='train_model',
-        python_callable=train_model,
-        dag=dag,
-        do_xcom_push=True
-    )
-
-    save_model_to_file = PythonOperator(
-        task_id='save_model_to_file',
-        python_callable=save_model_to_file,
-        dag=dag,
-        do_xcom_push=True
-    )
-    s3_upload_model = PythonOperator(
-        task_id='s3_upload_model',
-        python_callable=s3_upload_model,
-        dag=dag,
-        do_xcom_push=True
-    )
-
-    # Order of tasks
-    get_data >> train_model >> save_model_to_file >> s3_upload_model
+# Upload the file, renaming it in the process
+client.fput_object(
+    bucket_name, destination_file, source_file,
+)
+print(
+    source_file, "successfully uploaded as object",
+    destination_file, "to bucket", bucket_name,
+)
