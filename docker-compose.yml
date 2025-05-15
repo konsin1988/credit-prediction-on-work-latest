@@ -101,8 +101,9 @@ services:
   #       - cp-network
 
   s3:
+    platform: linux/amd64
     image: minio/minio:latest
-    container_name: cp-s3
+    container_name: cp-minio
     ports:
       - "9000:9000"
       - "9099:9099"
@@ -153,8 +154,8 @@ services:
   #     - cp-network
 
   db:
-    image: postgres:13
     platform: linux/amd64
+    image: postgres:13
     container_name: cp-postgres
     ports:
       - 5432:5432
